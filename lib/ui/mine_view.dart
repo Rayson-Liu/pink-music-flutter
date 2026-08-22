@@ -136,7 +136,7 @@ class _MineViewState extends State<MineView> {
                       onTap: () => showAboutDialog(
                         context: context,
                         applicationName: 'Pink Music',
-                        applicationVersion: '1.0.0',
+                        applicationVersion: '1.1.0',
                         applicationIcon: const Icon(Icons.music_note,
                             size: 40, color: Colors.pinkAccent),
                         children: const [

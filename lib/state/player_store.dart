@@ -39,10 +39,21 @@ class PlayerStore extends ChangeNotifier {
 
   // ---------- 播放控制 ----------
 
-  void setCurrentTrack(Track track) {
+  /// 设置当前曲目。`recordHistory` 为 false 时不写入播放历史
+  /// （用于分P/同视频内切P，避免历史被刷屏）。
+  void setCurrentTrack(Track track, {bool recordHistory = true}) {
     currentTrack = track;
     audioError = '';
-    addToPlayHistory(track);
+    if (recordHistory) {
+      addToPlayHistory(track);
+    }
+    notifyListeners();
+  }
+
+  /// 直接设置播放模式（供系统媒体中心 repeat/shuffle 命令调用）。
+  void setPlayMode(String mode) {
+    if (mode == playMode) return;
+    playMode = mode;
     notifyListeners();
   }
 

@@ -154,6 +154,10 @@ class LyricStore extends ChangeNotifier {
     currentLyric = lyric;
     lyricSource = source;
     currentLineIndex = -1; // 重置，避免旧索引越界（对应原 setCurrentLyric）
+    // 关键复位：缓存命中/手动歌词/网络完成三条路径都会走到这里——
+    // 否则在先一轮网络拉词仍在途时命中缓存（或竞态守卫丢弃在途结果）会
+    // 让 isLyricLoading 永久卡在 true，歌词面板一直显示「正在匹配歌词…」。
+    isLyricLoading = false;
     notifyListeners();
   }
 

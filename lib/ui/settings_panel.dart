@@ -377,7 +377,7 @@ class _SettingsPanelState extends State<SettingsPanel>
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
         ),
         const Center(
-            child: Text('v1.0.0',
+            child: Text('v1.1.0',
                 style: TextStyle(fontSize: 12, color: Colors.grey))),
         const SizedBox(height: 24),
         const Text('基于哔哩哔哩（B 站）公开接口的移动端音乐播放器',

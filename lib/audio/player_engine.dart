@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:math';
 
-import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import '../models/episode.dart';
 import '../models/track.dart';
@@ -50,6 +50,7 @@ class PlayerEngine {
   late final StreamSubscription<PlaybackEvent> _eventSub;
   late final StreamSubscription<PlayerState> _stateSub;
   late final StreamSubscription<int?> _sessionSub;
+  StreamSubscription<void>? _noisySub;
 
   String _currentPlayUrl = '';
   int _retryCount = 0;
@@ -72,6 +73,13 @@ class PlayerEngine {
   Future<void> init() async {
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration.music());
+    // 拔出耳机 / 断开蓝牙：自动暂停，避免音频在扬声器上外放
+    // （Android ACTION_AUDIO_BECOMING_NOISY，对应「蓝牙设备控制」体验闭环）
+    _noisySub = session.becomingNoisyEventStream.listen((_) {
+      if (player.playing) {
+        player.pause();
+      }
+    });
   }
 
   void _listen() {
@@ -124,15 +132,30 @@ class PlayerEngine {
       playerStore.setAudioError('该收藏内容暂不支持播放');
       return;
     }
+    // Android 13+：若启动时的通知权限弹窗被忽略/未授，媒体通知与系统媒体
+    // 控制（通知栏卡片 / 锁屏 / Android Auto）都不会出现。首次点播时再请求
+    // 一次（已授权时原生侧幂等直接返回，无副作用）。
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      try {
+        const channel = MethodChannel('com.pinkmusic.app/permissions');
+        await channel.invokeMethod('requestNotificationPermission');
+      } catch (_) {
+        // 通道未实现/失败不阻塞播放
+      }
+    }
     _retryCount = 0;
     _retrying = false;
     playerStore.setAudioError('');
-    playerStore.setCurrentTrack(track);
+    // 关键：先设置队列上下文，再设置当前曲目。否则 _sync 在 setCurrentTrack 的
+    // 首次 notify 里推送 mediaItem/queue 时，currentQueue 仍是空（q.isNotEmpty
+    // 为 false，queue 被跳过），而第二次 notify 的 id 未变又被守卫挡住——
+    // 系统媒体控制（锁屏队列 / Android Auto）永远拿不到队列与完整歌曲信息。
     if (queue != null) {
       playerStore.setQueueContext(view, queue);
     } else {
       playerStore.setQueueContext(view, [track]);
     }
+    playerStore.setCurrentTrack(track);
     // 多P：自动加载分P列表
     if (track.videos > 1) {
       loadEpisodes(track.bvid);
@@ -154,9 +177,10 @@ class PlayerEngine {
           loadEpisodes(track.bvid);
         }
         if (cid != null) {
-          // 回写 cid，供重试/分P逻辑使用
+          // 回写 cid，供重试/分P逻辑使用（recordHistory:false 避免重复入历史；
+          // 走 setCurrentTrack 保证 UI 与系统媒体中心同步刷新）
           resolved = track.copyWith(cid: cid);
-          playerStore.currentTrack = resolved;
+          playerStore.setCurrentTrack(resolved, recordHistory: false);
         }
       } catch (e) {
         debugPrint('获取视频信息失败: $e');
@@ -167,7 +191,7 @@ class PlayerEngine {
           cid = info['cid'];
           if (cid != null) {
             resolved = track.copyWith(cid: cid);
-            playerStore.currentTrack = resolved;
+            playerStore.setCurrentTrack(resolved, recordHistory: false);
           }
         } catch (e2) {
           debugPrint('获取视频信息重试失败: $e2');
@@ -232,13 +256,14 @@ class PlayerEngine {
     }
   }
 
-  /// 候选链播放：FLAC→DASH各档→durl，每档依次尝试 主/备地址 × 带/不带 Cookie
-  Future<void> _playStream(Track track, List<StreamInfo> candidates) async {
+  /// 候选链播放：FLAC→DASH各档→durl，每档依次尝试 主/备地址 × 带/不带 Cookie。
+  /// 任一候选成功返回 true；全部失败时触发重试并返回 false（供重试链补错误文案）。
+  Future<bool> _playStream(Track track, List<StreamInfo> candidates) async {
     for (final stream in candidates) {
       final urls = <String>[stream.url, ...stream.backupUrls];
       for (final url in urls) {
         if (url.isEmpty || url == 'null') continue;
-        if (url == _currentPlayUrl && player.playing) return;
+        if (url == _currentPlayUrl && player.playing) return true;
         for (final withCookie in [true, false]) {
           try {
             _currentPlayUrl = url;
@@ -247,13 +272,17 @@ class PlayerEngine {
               headers: withCookie
                   ? _streamHeadersWithCookie()
                   : Map.of(_streamHeaders),
-              tag: _mediaItem(track, stream),
+              tag: <String, String>{
+                'title': track.title,
+                'author': track.author,
+                'url': url,
+              },
             );
             // 播放成功：清掉之前的错误文案
             playerStore.setAudioError('');
             await player.play();
             debugPrint('播放成功: ${stream.label} host=${_urlHost(url)}');
-            return;
+            return true;
           } catch (e) {
             _lastPlayError = '$e';
             debugPrint('播放流失败(${stream.label} '
@@ -263,7 +292,9 @@ class PlayerEngine {
       }
     }
     // 全部地址失败 → 统一走重试（事件流错误也可能同时触发，由 _retrying 去重）
-    _onPlaybackError(-1, _lastPlayError);
+    final detail = _lastPlayError.isEmpty ? '无可用音源' : _lastPlayError;
+    _onPlaybackError(-1, detail);
+    return false;
   }
 
   /// 拉流请求头：Referer + UA + 登录态 Cookie（对齐原项目 electron 的请求拦截器）
@@ -273,15 +304,6 @@ class PlayerEngine {
     if (cookie.isNotEmpty) header['Cookie'] = cookie;
     return header;
   }
-
-  MediaItem _mediaItem(Track track, StreamInfo stream) => MediaItem(
-        id: stream.url,
-        title: track.title,
-        artist: track.author,
-        album: 'Pink Music',
-        artUri: track.cover.isNotEmpty ? Uri.tryParse(track.cover) : null,
-        duration: Duration(seconds: track.duration.toInt()),
-      );
 
   void _onPlaybackError(int code, String message) {
     debugPrint('播放错误($code): $message');
@@ -324,7 +346,15 @@ class PlayerEngine {
         playerStore.setAudioError('播放失败：无可用音源');
         return;
       }
-      await _playStream(track, candidates);
+      final ok = await _playStream(track, candidates);
+      if (!ok) {
+        // 重试链全部耗尽：必须在这里补出错误文案——重试期间 _onPlaybackError
+        // 会被 _retrying 守卫吞掉，否则界面只剩「点了没反应」的静默失败。
+        final detail = _lastPlayError.isEmpty
+            ? ''
+            : '：${_shortError(_lastPlayError)}';
+        playerStore.setAudioError('播放失败$detail');
+      }
     } catch (e) {
       debugPrint('重试播放失败: $e');
       _lastPlayError = '$e';
@@ -340,13 +370,21 @@ class PlayerEngine {
       if (player.playing) {
         await player.pause();
       } else if (player.processingState == ProcessingState.idle) {
-        // 错误/空闲态：重新加载当前曲目（不再残留错误）
+        // 空闲/错误态：just_audio 加载失败后 processingState 即回到 idle
+        // （错误随 errorCode 播报），与「尚未加载」一样重新加载当前曲目
         _retryCount = 0;
         _lastPlayError = '';
         final track = playerStore.currentTrack;
         if (track != null) {
           await _loadAndPlay(track);
         }
+      } else if (player.processingState == ProcessingState.completed) {
+        // 播完态：just_audio 在 completed 上直接 play() 不会重新起播
+        // （ExoPlayer 停在末尾，需先 seek 归零），这里归零后重播当前曲目。
+        _retryCount = 0;
+        _lastPlayError = '';
+        await player.seek(Duration.zero);
+        await player.play();
       } else {
         await player.play();
       }
@@ -414,8 +452,17 @@ class PlayerEngine {
       final idx = playerStore.currentEpisodeIndex;
       final mode = playerStore.playMode;
       int next;
-      if (mode == 'shuffle') {
-        next = _random.nextInt(eps.length);
+      if (eps.length == 1) {
+        next = 0;
+      } else if (mode == 'shuffle') {
+        // 与队列分支一致：随机时排除当前P，避免「下一首」原地不动
+        do {
+          next = _random.nextInt(eps.length);
+        } while (next == idx);
+      } else if (mode == 'order' && idx >= eps.length - 1) {
+        // 顺序播放：最后一P 后停止（对齐原项目 getNextMusicIndex 的 order 语义）
+        await player.pause();
+        return;
       } else {
         next = (idx + 1) % eps.length;
       }
@@ -429,7 +476,11 @@ class PlayerEngine {
     }
     final queue = playerStore.currentQueue;
     if (idx < queue.length) {
-      await playMusic(queue[idx]);
+      // 关键：必须把当前 view + 完整队列回传 playMusic，否则它默认会
+      // setQueueContext(view, [track]) 把队列重置为单曲，导致切到第二首后
+      // 无论任何播放模式都无法再继续切歌（order 停、其余重复同一首）。
+      await playMusic(queue[idx],
+          view: playerStore.currentView, queue: playerStore.currentQueue);
     }
   }
 
@@ -471,7 +522,9 @@ class PlayerEngine {
     final idx = getPreviousMusicIndex();
     final queue = playerStore.currentQueue;
     if (idx >= 0 && idx < queue.length) {
-      await playMusic(queue[idx]);
+      // 同上：保留 view + 完整队列，避免 playMusic 把队列重置为单曲
+      await playMusic(queue[idx],
+          view: playerStore.currentView, queue: playerStore.currentQueue);
     }
   }
 
@@ -515,6 +568,9 @@ class PlayerEngine {
     playerStore.setEpisodes(playerStore.currentVideoEpisodes,
         activeIndex: playerStore.currentVideoEpisodes
             .indexWhere((e) => e.cid == ep.cid));
+    // 同步当前曲目为分P合并后的版本（标题/时长/cid），但不写入播放历史，
+    // 通知栏元数据与播放页标题随之刷新（bvid 不变、cid/title 变化）。
+    playerStore.setCurrentTrack(merged, recordHistory: false);
     await _loadAndPlay(merged);
   }
 
@@ -534,6 +590,7 @@ class PlayerEngine {
     await _eventSub.cancel();
     await _stateSub.cancel();
     await _sessionSub.cancel();
+    await _noisySub?.cancel();
     await eqController.release();
     await player.dispose();
   }

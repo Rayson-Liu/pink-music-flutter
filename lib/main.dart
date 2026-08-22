@@ -1,57 +1,31 @@
-import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'app.dart';
-import 'audio/audio_handler.dart';
+import 'audio/media_bridge.dart';
 import 'state/app_theme.dart';
 import 'ui/home_shell.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  try {
-    const channel = MethodChannel('com.pinkmusic.app/permissions');
-    await channel.invokeMethod('requestNotificationPermission');
-  } catch (e) {
-    debugPrint('Permission error: $e');
-  }
-
   final services = AppServices();
   AppServices.instance = services;
 
-  late PinkAudioHandler audioHandler;
-  try {
-    audioHandler = await AudioService.init(
-      builder: () => PinkAudioHandler(),
-      config: const AudioServiceConfig(
-        androidNotificationChannelId: 'com.pinkmusic.app.channel.audio',
-        androidNotificationChannelName: 'Pink Music 播放控制',
-        androidNotificationOngoing: true,
-        androidStopForegroundOnPause: true,
-        // 状态栏/超级岛小图标（通知 compact view 与灵动岛均需要）
-        androidNotificationIcon: 'mipmap/ic_launcher',
-      ),
-    ) ;
-    debugPrint('AudioService.init OK');
-  } catch (e) {
-    debugPrint('AudioService.init error: $e');
-    audioHandler = PinkAudioHandler();
-  }
+  // 系统媒体控制桥接（通知栏 / 锁屏 / 蓝牙耳机 / 系统媒体中心）。
+  // 底层由 flutter_media_session（androidx.media3 MediaSessionService）提供。
+  final bridge = PinkMediaBridge();
 
-  bool initOk = false;
   try {
     await services.init();
-    initOk = true;
     debugPrint('AppServices.init OK');
   } catch (e) {
     debugPrint('AppServices.init error: $e');
     services.initError = '$e';
   }
 
-  if (initOk) {
-    audioHandler.attach();
-  }
+  // 媒体控制注册不依赖 services.init 成败：_sync 内部有 instanceReady 守卫，
+  // 即使初始化任一步失败也保持注册（激活会话时插件自动请求通知权限）。
+  bridge.attach();
 
   runApp(const PinkMusicApp());
 }
